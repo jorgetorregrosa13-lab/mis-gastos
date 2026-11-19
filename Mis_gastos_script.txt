@@ -1,0 +1,638 @@
+/**
+ * Mis gastos
+ *  1. Lee los extractos de Sabadell que dejas en Drive y los clasifica (menú "Mis gastos" de la hoja).
+ *  2. Sirve la app del móvil: Implementar > Nueva implementación > Aplicación web,
+ *     "Ejecutar como: yo" y "Quién tiene acceso: solo yo".
+ */
+var HOJA_ID = '1mNoeLekXBJVGofe7I8TwEYVJ9bwXpocBmBXcL8JmEFk';    // hoja "Mis gastos"
+var FOLDER_ID = '19U6Fxfq6Y4s_Xix4gJ244l1HY-thRAEt';            // carpeta "Mis gastos - Extractos"
+var APP_FOLDER_ID = '1FxYlxNkylwPTG7vsPa5gbW2NsVm08VKA';        // carpeta "Mis gastos - App"
+var PAGINA = 'app-mis-gastos.html';                              // pantalla de la app (la más reciente con ese nombre)
+var CAL_NOMBRE = 'Pagos';                                        // calendario de Google con tus pagos y cobros
+var SH = {MOV: 'Movimientos', REG: 'Reglas', CAT: 'Categorías', RES: 'Resumen', PRE: 'Presupuesto', LOG: 'Registro', HUC: 'Huchas'};
+var SIN = 'Sin clasificar';
+
+/* ====================== Menú y disparadores ====================== */
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('Mis gastos')
+    .addItem('Leer extractos nuevos de Drive', 'leerExtractos')
+    .addItem('Actualizar resumen', 'actualizarResumen')
+    .addSeparator()
+    .addItem('Activar lectura automática diaria', 'activarAutomatico')
+    .addItem('Desactivar lectura automática', 'desactivarAutomatico')
+    .addToUi();
+}
+
+function activarAutomatico() {
+  desactivarAutomatico();
+  ScriptApp.newTrigger('leerExtractos').timeBased().everyDays(1).atHour(7).create();
+  aviso_('Lectura automática activada: cada día sobre las 7:00.');
+}
+
+function desactivarAutomatico() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'leerExtractos') ScriptApp.deleteTrigger(t);
+  });
+}
+
+function onEdit(e) {
+  try {
+    if (!e || !e.range) return;
+    var sh = e.range.getSheet(), name = sh.getName();
+    if (name === SH.MOV) {
+      var c1 = e.range.getColumn(), c2 = e.range.getLastColumn(), r1 = e.range.getRow(), n = e.range.getNumRows();
+      if (c1 > 5 || c2 < 1) return;                       // solo fecha, concepto, categoría, grupo, importe
+      if (r1 === 1) { r1 = 2; n--; }
+      if (n < 1) return;
+      if (c1 <= 3 && c2 >= 3) {
+        var cats = getCats_();
+        var vals = sh.getRange(r1, 2, n, 2).getValues();  // concepto, categoría
+        sh.getRange(r1, 4, n, 1).setValues(vals.map(function (v) { var c = cats.map[v[1]]; return [c ? c.group : '']; }));
+        if (n === 1 && e.range.getNumColumns() === 1 && cats.map[vals[0][1]]) aprender_(vals[0][0], vals[0][1]);
+      }
+      actualizarResumen();
+    } else if (name === SH.CAT || name === SH.PRE) {
+      actualizarResumen();
+    }
+  } catch (err) { /* un fallo aquí no debe molestar al editar */ }
+}
+
+/* ====================== Funciones puras (sin acceso a hojas) ====================== */
+function norm_(s) {
+  return String(s == null ? '' : s).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/\d{3,}/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function clean_(c) {
+  return String(c == null ? '' : c).replace(/COMPRA TARJ\.\s*/i, '').replace(/(DEVOLUCION) TAR\./i, '$1 ')
+    .replace(/\d{4}X{4,}\d{4}\s*/gi, '').replace(/\s+/g, ' ').trim();
+}
+
+function parseAmount_(v) {
+  if (v === null || v === undefined || v === '') return null;
+  if (typeof v === 'number') return v;
+  var s = String(v).replace(/[€\s ]|EUR/gi, '');
+  if (!s) return null;
+  var neg = false;
+  if (/^\(.*\)$/.test(s)) { neg = true; s = s.slice(1, -1); }
+  if (/-$/.test(s)) { neg = true; s = s.slice(0, -1); }
+  if (/^-/.test(s)) { neg = !neg; s = s.slice(1); }
+  s = s.replace(/^\+/, '');
+  var d = s.lastIndexOf('.'), c = s.lastIndexOf(',');
+  if (d > -1 && c > -1) s = c > d ? s.replace(/\./g, '').replace(',', '.') : s.replace(/,/g, '');
+  else if (c > -1) s = s.replace(',', '.');
+  else if (/^\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g, '');
+  if (!/^\d*\.?\d+$/.test(s)) return null;
+  var n = parseFloat(s);
+  return neg ? -n : n;
+}
+
+function pad2_(n) { return (n < 10 ? '0' : '') + n; }
+
+/** Devuelve 'aaaa-mm-dd' a partir de un texto de fecha (dd/mm/aaaa, dd-mm-aa, aaaa-mm-dd). */
+function parseDateStr_(v) {
+  var s = String(v == null ? '' : v).trim(), m;
+  function ok(y, mo, d) { return y > 1990 && y < 2100 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31 ? y + '-' + pad2_(mo) + '-' + pad2_(d) : null; }
+  m = s.match(/^(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})/);
+  if (m) return ok(+m[1], +m[2], +m[3]);
+  m = s.match(/^(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4})/);
+  if (m) return ok(+m[3] < 100 ? 2000 + (+m[3]) : +m[3], +m[2], +m[1]);
+  return null;
+}
+
+/** Localiza la fila de cabecera y las columnas de fecha, concepto, importe (o cargo/abono) y saldo. */
+function detect_(rows) {
+  var map = {date: -1, concept: -1, amount: -1, cargo: -1, abono: -1, saldo: -1}, hdr = -1;
+  function isD(c) { return /fecha|date|^f\.? ?(operativa|operacion|valor|contable)/.test(c); }
+  for (var i = 0; i < Math.min(rows.length, 40); i++) {
+    var cells = (rows[i] || []).map(function (c) { return c instanceof Date ? '' : norm_(c); });
+    var hasD = cells.some(isD), hasA = cells.some(function (c) { return /importe|cantidad|amount|cargo|abono|debe|haber/.test(c); });
+    if (!(hasD && hasA)) continue;
+    hdr = i;
+    for (var j = 0; j < cells.length; j++) {
+      var c = cells[j];
+      if (isD(c) && (map.date < 0 || (/valor/.test(cells[map.date]) && !/valor/.test(c)))) map.date = j;
+      if (map.saldo < 0 && /^saldo/.test(c)) map.saldo = j;
+      if (map.concept < 0 && /concepto|descrip|detalle|movimiento|comercio/.test(c) && !isD(c)) map.concept = j;
+      if (map.amount < 0 && /importe|cantidad|amount/.test(c) && !/saldo|divisa/.test(c)) map.amount = j;
+      if (map.cargo < 0 && /cargo|debe|gasto/.test(c)) map.cargo = j;
+      if (map.abono < 0 && /abono|haber|ingreso/.test(c)) map.abono = j;
+    }
+    break;
+  }
+  if (map.amount >= 0) { map.cargo = -1; map.abono = -1; }
+  return {hdr: hdr, map: map};
+}
+
+/** rules: [{k: texto normalizado, cat: nombre de categoría}] en orden de prioridad. */
+function classify_(concept, amount, rules) {
+  var n = norm_(concept);
+  for (var i = 0; i < rules.length; i++) if (rules[i].k && n.indexOf(rules[i].k) > -1) return rules[i].cat;
+  if (amount > 0 && /bizum/.test(n)) return 'Bizum recibido';
+  if (amount < 0 && /^pago bizum/.test(n)) return 'Bizum enviado';
+  if (amount > 0 && /nomina|salario|sueldo/.test(n)) return 'Nómina';
+  if (amount > 0 && /devoluc|reembolso/.test(n)) return 'Devoluciones';
+  return SIN;
+}
+
+function round2_(n) { return Math.round((n + Number.EPSILON) * 100) / 100; }
+
+function key_(ymd, a, c, s) { return ymd + '|' + round2_(a) + '|' + norm_(c) + '|' + (s === null || s === undefined || s === '' ? '' : round2_(s)); }
+
+/** Convierte las filas de un extracto en movimientos {d, c, a, s, cat}. toYmd convierte objetos Date. */
+function buildMovs_(rows, rules, toYmd) {
+  var det = detect_(rows), m = det.map, out = [];
+  if (det.hdr < 0 || m.date < 0) return {movs: out, error: 'No se ha encontrado la cabecera (fecha e importe).'};
+  for (var i = det.hdr + 1; i < rows.length; i++) {
+    var r = rows[i] || [], dv = r[m.date];
+    var d = dv instanceof Date ? toYmd(dv) : parseDateStr_(dv);
+    if (!d) continue;
+    var a = null;
+    if (m.amount >= 0) a = parseAmount_(r[m.amount]);
+    else { var cg = parseAmount_(r[m.cargo]), ab = parseAmount_(r[m.abono]); if (cg !== null || ab !== null) a = (ab || 0) - Math.abs(cg || 0); }
+    if (a === null || a === 0 || isNaN(a)) continue;
+    a = round2_(a);
+    var c = clean_(m.concept >= 0 ? r[m.concept] : '') || '(sin concepto)';
+    var sv = m.saldo >= 0 ? parseAmount_(r[m.saldo]) : null;
+    out.push({d: d, c: c, a: a, s: sv === null ? '' : round2_(sv), cat: classify_(c, a, rules)});
+  }
+  return {movs: out, error: ''};
+}
+
+/**
+ * Resumen como tabla. movs: [{d, cat, a}]; cats: {order: [nombres], map: {nombre: {group, kind}}};
+ * budget: {grupo: importe}. kind: 'Ingreso' | 'Gasto' | 'Ahorro' | 'No cuenta'.
+ */
+function summarize_(movs, cats, budget) {
+  var months = {}, T = {}, G = {}, C = {}, unc = 0;
+  movs.forEach(function (t) {
+    var ym = t.d.slice(0, 7); months[ym] = 1;
+    var info = cats.map[t.cat], kind = info ? info.kind : null;
+    if (!info || t.cat === SIN) { unc++; kind = t.a > 0 ? 'Ingreso' : 'Gasto'; }
+    T[ym] = T[ym] || {inc: 0, exp: 0, sav: 0};
+    if (kind === 'Ingreso') T[ym].inc += t.a;
+    else if (kind === 'Ahorro') T[ym].sav -= t.a;
+    else if (kind === 'Gasto') {
+      T[ym].exp -= t.a;
+      var g = info ? info.group : 'Banco y varios', cn = info ? t.cat : SIN;
+      G[g] = G[g] || {}; G[g][ym] = (G[g][ym] || 0) - t.a;
+      C[cn] = C[cn] || {}; C[cn][ym] = (C[cn][ym] || 0) - t.a;
+    }
+  });
+  var ms = Object.keys(months).sort(), grid = [], marks = {};
+  function row(label, fn, extra) {
+    var r = [label], tot = 0;
+    ms.forEach(function (m) { var v = round2_(fn(m) || 0); r.push(v); tot += v; });
+    r.push(round2_(tot));
+    if (extra !== undefined) r.push(extra);
+    return r;
+  }
+  var z = function (m) { return T[m] || {inc: 0, exp: 0, sav: 0}; };
+  marks.totalsHeader = grid.length;
+  grid.push(['Resumen mensual'].concat(ms).concat(['Total']));
+  grid.push(row('Ingresos', function (m) { return z(m).inc; }));
+  grid.push(row('Gastos sin ahorro', function (m) { return z(m).exp; }));
+  grid.push(row('Ahorro', function (m) { return z(m).sav; }));
+  grid.push(row('Sobrante', function (m) { return z(m).inc - z(m).exp - z(m).sav; }));
+  var rate = ['Tasa de ahorro'], ti = 0, ts = 0;
+  ms.forEach(function (m) { ti += z(m).inc; ts += z(m).sav; rate.push(z(m).inc > 0 ? z(m).sav / z(m).inc : ''); });
+  rate.push(ti > 0 ? ts / ti : '');
+  marks.rate = grid.length; grid.push(rate);
+  grid.push([]);
+  marks.groupsHeader = grid.length;
+  grid.push(['Gasto por grupo'].concat(ms).concat(['Total', 'Presupuesto mensual']));
+  var seenG = {}, groups = [];
+  cats.order.forEach(function (n) { var i = cats.map[n]; if (i.kind === 'Gasto' && !seenG[i.group]) { seenG[i.group] = 1; groups.push(i.group); } });
+  marks.groupsFirst = grid.length;
+  groups.forEach(function (g) { if (G[g]) grid.push(row(g, function (m) { return G[g][m]; }, budget[g] || '')); });
+  marks.groupsLast = grid.length - 1;
+  grid.push([]);
+  marks.catsHeader = grid.length;
+  grid.push(['Gasto por categoría'].concat(ms).concat(['Total', 'Grupo']));
+  cats.order.forEach(function (n) { if (C[n]) grid.push(row(n, function (m) { return C[n][m]; }, cats.map[n].group)); });
+  if (C[SIN] && !cats.map[SIN]) grid.push(row(SIN, function (m) { return C[SIN][m]; }, 'Banco y varios'));
+  return {grid: grid, months: ms, marks: marks, unc: unc};
+}
+
+/* ====================== Acceso a las hojas ====================== */
+function ss_() { var s = null; try { s = SpreadsheetApp.getActive(); } catch (e) {} return s || SpreadsheetApp.openById(HOJA_ID); }
+
+function hoja_(name, headers) {
+  var sh = ss_().getSheetByName(name);
+  if (!sh) { sh = ss_().insertSheet(name); if (headers) sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold'); }
+  return sh;
+}
+
+function getCats_() {
+  var sh = ss_().getSheetByName(SH.CAT), out = {order: [], map: {}};
+  if (!sh || sh.getLastRow() < 2) return out;
+  sh.getRange(2, 1, sh.getLastRow() - 1, 3).getValues().forEach(function (r) {
+    var n = String(r[0]).trim(); if (!n) return;
+    out.order.push(n); out.map[n] = {group: String(r[1]).trim(), kind: String(r[2]).trim()};
+  });
+  return out;
+}
+
+function getRules_() {
+  var sh = ss_().getSheetByName(SH.REG);
+  if (!sh || sh.getLastRow() < 2) return [];
+  return sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues()
+    .map(function (r) { return {k: norm_(r[0]), cat: String(r[1]).trim()}; })
+    .filter(function (r) { return r.k && r.cat; });
+}
+
+function getBudget_() {
+  var sh = ss_().getSheetByName(SH.PRE), out = {};
+  if (!sh || sh.getLastRow() < 2) return out;
+  sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues().forEach(function (r) { var v = parseAmount_(r[1]); if (r[0] && v) out[String(r[0]).trim()] = v; });
+  return out;
+}
+
+function ymd_(v, tz) { return v instanceof Date ? Utilities.formatDate(v, tz, 'yyyy-MM-dd') : parseDateStr_(v); }
+
+/** Movimientos guardados: [{d, c, cat, a, s}] */
+function readMovs_() {
+  var sh = ss_().getSheetByName(SH.MOV), tz = ss_().getSpreadsheetTimeZone(), out = [];
+  if (!sh || sh.getLastRow() < 2) return out;
+  sh.getRange(2, 1, sh.getLastRow() - 1, 6).getValues().forEach(function (r) {
+    var d = ymd_(r[0], tz), a = parseAmount_(r[4]);
+    if (!d || a === null) return;
+    out.push({d: d, c: String(r[1]), cat: String(r[2]).trim(), a: a, s: r[5] === '' ? '' : parseAmount_(r[5])});
+  });
+  return out;
+}
+
+function aprender_(concepto, categoria) {
+  var k = norm_(concepto).replace(/^\d\d\.\d\d /, '').slice(0, 40).trim();
+  if (k.length < 4 || categoria === SIN || /^(pago|abono) bizum/.test(k)) return;
+  var sh = hoja_(SH.REG, ['Si el concepto contiene…', 'Categoría']);
+  var last = sh.getLastRow();
+  if (last >= 2) {
+    var vals = sh.getRange(2, 1, last - 1, 1).getValues();
+    for (var i = 0; i < vals.length; i++) if (norm_(vals[i][0]) === k) { sh.getRange(i + 2, 2).setValue(categoria); return; }
+  }
+  sh.insertRowBefore(2);
+  sh.getRange(2, 1, 1, 2).setValues([[k, categoria]]);
+}
+
+function aviso_(msg) { try { ss_().toast(msg, 'Mis gastos', 8); } catch (e) {} }
+
+function registrar_(archivo, leidos, nuevos, dup, sinClas, error) {
+  var sh = hoja_(SH.LOG, ['Fecha', 'Archivo', 'Movimientos leídos', 'Nuevos', 'Ya guardados', 'Sin clasificar', 'Error']);
+  sh.appendRow([new Date(), archivo, leidos, nuevos, dup, sinClas, error || '']);
+}
+
+/* ====================== Lectura de archivos de Drive ====================== */
+function filasDeArchivo_(file) {
+  var name = file.getName();
+  if (/\.(csv|txt)$/i.test(name)) {
+    var blob = file.getBlob(), text = blob.getDataAsString('UTF-8');
+    if (text.indexOf('�') > -1) text = blob.getDataAsString('ISO-8859-1');
+    text = text.replace(/^﻿/, '');
+    var head = text.split(/\r?\n/).slice(0, 10).join('\n');
+    var cnt = function (ch) { return head.split(ch).length; };
+    var del = cnt(';') >= cnt(',') && cnt(';') >= cnt('\t') ? ';' : (cnt('\t') > cnt(',') ? '\t' : ',');
+    return {rows: Utilities.parseCsv(text, del), tz: ss_().getSpreadsheetTimeZone()};
+  }
+  // .xls / .xlsx: se convierte a una hoja de Google temporal, se lee y se envía a la papelera
+  var resp = UrlFetchApp.fetch('https://www.googleapis.com/drive/v3/files/' + file.getId() + '/copy?supportsAllDrives=true', {
+    method: 'post', contentType: 'application/json', muteHttpExceptions: true,
+    headers: {Authorization: 'Bearer ' + ScriptApp.getOAuthToken()},
+    payload: JSON.stringify({name: 'tmp_mis_gastos_' + name, mimeType: 'application/vnd.google-apps.spreadsheet'})
+  });
+  if (resp.getResponseCode() !== 200) throw new Error('No se ha podido convertir el Excel (' + resp.getResponseCode() + '): ' + resp.getContentText().slice(0, 200));
+  var id = JSON.parse(resp.getContentText()).id, tmp = SpreadsheetApp.openById(id);
+  try {
+    return {rows: tmp.getSheets()[0].getDataRange().getValues(), tz: tmp.getSpreadsheetTimeZone()};
+  } finally {
+    try { DriveApp.getFileById(id).setTrashed(true); } catch (e) {}
+  }
+}
+
+function leerExtractos() {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) return;
+  try {
+    var folder = DriveApp.getFolderById(FOLDER_ID);
+    var it = folder.getFiles(), files = [];
+    while (it.hasNext()) { var f = it.next(); if (/\.(xlsx?|csv|txt)$/i.test(f.getName())) files.push(f); }
+    if (!files.length) { aviso_('No hay extractos nuevos en la carpeta de Drive.'); return; }
+    files.sort(function (a, b) { return a.getName() < b.getName() ? -1 : 1; });
+
+    var sh = hoja_(SH.MOV, ['Fecha', 'Concepto', 'Categoría', 'Grupo', 'Importe', 'Saldo', 'Origen']);
+    var cats = getCats_(), rules = getRules_(), tz = ss_().getSpreadsheetTimeZone();
+    var keys = {};
+    readMovs_().forEach(function (t) { keys[key_(t.d, t.a, t.c, t.s)] = 1; });
+    var leidos = getOrCreateSub_(folder, 'Leídos'), totalNuevos = 0, totalSin = 0;
+
+    files.forEach(function (file) {
+      var nombre = file.getName();
+      try {
+        var data = filasDeArchivo_(file);
+        var res = buildMovs_(data.rows, rules, function (d) { return Utilities.formatDate(d, data.tz, 'yyyy-MM-dd'); });
+        if (res.error) { registrar_(nombre, 0, 0, 0, 0, res.error); return; }
+        var nuevos = res.movs.filter(function (t) { return !keys[key_(t.d, t.a, t.c, t.s)]; });
+        var sinClas = nuevos.filter(function (t) { return t.cat === SIN; }).length;
+        if (nuevos.length) {
+          var out = nuevos.map(function (t) {
+            var info = cats.map[t.cat];
+            return [Utilities.parseDate(t.d + ' 12:00', tz, 'yyyy-MM-dd HH:mm'), t.c, t.cat, info ? info.group : '', t.a, t.s, nombre];
+          });
+          var start = sh.getLastRow() + 1;
+          sh.getRange(start, 1, out.length, 7).setValues(out);
+          sh.getRange(start, 1, out.length, 1).setNumberFormat('dd/mm/yyyy');
+          sh.getRange(start, 5, out.length, 2).setNumberFormat('#,##0.00');
+        }
+        res.movs.forEach(function (t) { keys[key_(t.d, t.a, t.c, t.s)] = 1; });
+        registrar_(nombre, res.movs.length, nuevos.length, res.movs.length - nuevos.length, sinClas, '');
+        totalNuevos += nuevos.length; totalSin += sinClas;
+        file.moveTo(leidos);
+      } catch (err) {
+        registrar_(nombre, 0, 0, 0, 0, String(err && err.message || err));
+      }
+    });
+
+    if (sh.getLastRow() > 2) sh.getRange(2, 1, sh.getLastRow() - 1, 7).sort({column: 1, ascending: false});
+    actualizarResumen();
+    aviso_(totalNuevos + ' movimientos nuevos' + (totalSin ? ' (' + totalSin + ' sin clasificar)' : '') + '. Detalle en la hoja Registro.');
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getOrCreateSub_(folder, name) {
+  var it = folder.getFoldersByName(name);
+  return it.hasNext() ? it.next() : folder.createFolder(name);
+}
+
+/* ====================== Resumen ====================== */
+function actualizarResumen() {
+  var sh = hoja_(SH.RES), cats = getCats_();
+  var res = summarize_(readMovs_(), cats, getBudget_());
+  var width = 1; res.grid.forEach(function (r) { width = Math.max(width, r.length); });
+  var top = [['Mis gastos'], ['Actualizado el ' + Utilities.formatDate(new Date(), ss_().getSpreadsheetTimeZone(), 'dd/MM/yyyy HH:mm') +
+    (res.unc ? ' · ' + res.unc + ' movimientos sin clasificar' : '')], []];
+  var all = top.concat(res.grid).map(function (r) { r = r.slice(); while (r.length < width) r.push(''); return r; });
+  sh.getCharts().forEach(function (c) { sh.removeChart(c); });
+  sh.clear();
+  sh.getRange(1, 1, all.length, width).setValues(all);
+  var off = top.length + 1, mk = res.marks, nm = res.months.length;
+  sh.getRange(1, 1).setFontSize(16).setFontWeight('bold');
+  sh.getRange(2, 1).setFontColor('#5a6964');
+  [mk.totalsHeader, mk.groupsHeader, mk.catsHeader].forEach(function (i) {
+    sh.getRange(off + i, 1, 1, width).setFontWeight('bold').setBackground('#0e5a4b').setFontColor('#ffffff');
+  });
+  sh.getRange(off, 2, res.grid.length, Math.max(1, nm + 2)).setNumberFormat('#,##0.00').setHorizontalAlignment('right');
+  sh.getRange(off + mk.rate, 2, 1, nm + 1).setNumberFormat('0%');
+  sh.getRange(off + mk.totalsHeader + 4, 1, 1, nm + 2).setFontWeight('bold');
+  sh.setFrozenColumns(1);
+  sh.setColumnWidth(1, 230);
+  try {
+    if (nm) {
+      var c1 = sh.newChart().setChartType(Charts.ChartType.COLUMN)
+        .addRange(sh.getRange(off + mk.totalsHeader, 1, 4, nm + 1))
+        .setTransposeRowsAndColumns(true).setNumHeaders(1)
+        .setOption('title', 'Ingresos, gastos y ahorro por mes')
+        .setOption('colors', ['#2a78d6', '#eb6834', '#1baf7a'])
+        .setPosition(off + mk.totalsHeader, width + 2, 0, 0).build();
+      sh.insertChart(c1);
+      if (mk.groupsLast >= mk.groupsFirst) {
+        var n = mk.groupsLast - mk.groupsFirst + 1;
+        var c2 = sh.newChart().setChartType(Charts.ChartType.BAR)
+          .addRange(sh.getRange(off + mk.groupsHeader, 1, n + 1, 1))
+          .addRange(sh.getRange(off + mk.groupsHeader, nm + 1, n + 1, 1))
+          .setNumHeaders(1)
+          .setOption('title', 'Gasto por grupo en ' + res.months[nm - 1])
+          .setOption('colors', ['#eb6834']).setOption('legend', {position: 'none'})
+          .setPosition(off + mk.totalsHeader + 19, width + 2, 0, 0).build();
+        sh.insertChart(c2);
+      }
+    }
+  } catch (err) { /* los gráficos son opcionales */ }
+}
+
+/* ====================== App del móvil ====================== */
+function doGet() {
+  var it = DriveApp.getFolderById(APP_FOLDER_ID).getFilesByName(PAGINA), mejor = null;
+  while (it.hasNext()) {
+    var f = it.next();
+    if (!f.isTrashed() && (!mejor || f.getLastUpdated() > mejor.getLastUpdated())) mejor = f;
+  }
+  if (!mejor) return HtmlService.createHtmlOutput('No encuentro ' + PAGINA + ' en la carpeta «Mis gastos - App» de tu Drive.');
+  return HtmlService.createHtmlOutput(mejor.getBlob().getDataAsString('UTF-8'))
+    .setTitle('Mis gastos')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)   // necesario para abrirla dentro de la app instalable
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1, viewport-fit=cover')
+    .addMetaTag('mobile-web-app-capable', 'yes')
+    .addMetaTag('apple-mobile-web-app-capable', 'yes');
+}
+
+function conBloqueo_(fn) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try { return fn(); } finally { lock.releaseLock(); }
+}
+
+/** Tipo de movimiento que entiende la app. */
+function tipo_(info, cat, a) {
+  if (!info || cat === SIN) return a > 0 ? 'Ingreso' : 'Gasto';
+  return {'Ingreso': 'Ingreso', 'Gasto': 'Gasto', 'Ahorro': 'Ahorro', 'No cuenta': 'Traspaso'}[info.kind] || 'Gasto';
+}
+
+/** Saldo más reciente: entre los movimientos del último día, el que no es el "saldo anterior" de ningún otro. */
+function saldoActual_(movs) {
+  var conSaldo = movs.filter(function (t) { return typeof t.s === 'number'; });
+  if (!conSaldo.length) return null;
+  var ultimo = conSaldo.reduce(function (m, t) { return t.d > m ? t.d : m; }, '');
+  var dia = conSaldo.filter(function (t) { return t.d === ultimo; });
+  var previos = {};
+  dia.forEach(function (t) { previos[round2_(t.s - t.a).toFixed(2)] = 1; });
+  var fin = dia.filter(function (t) { return !previos[round2_(t.s).toFixed(2)]; });
+  return {saldo: (fin[0] || dia[0]).s, fecha: ultimo};
+}
+
+/** Todo lo que necesita la app, en una sola llamada. */
+function getDatos() {
+  var ss = ss_(), tz = ss.getSpreadsheetTimeZone(), cats = getCats_(), budget = getBudget_();
+  var hoy = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  var sh = ss.getSheetByName(SH.MOV), base = [];
+  if (sh && sh.getLastRow() > 1) {
+    sh.getRange(2, 1, sh.getLastRow() - 1, 6).getValues().forEach(function (r, i) {
+      var d = ymd_(r[0], tz), a = parseAmount_(r[4]);
+      if (!d || a === null) return;
+      var cat = String(r[2]).trim(), info = cats.map[cat];
+      base.push({d: d, c: String(r[1]), a: a, s: r[5] === '' ? null : parseAmount_(r[5]), cat: info ? cat : SIN, tipo: tipo_(info, cat, a), fila: i + 2});
+    });
+  }
+  // La hoja va de más reciente a más antiguo; la app quiere orden cronológico.
+  base.reverse();
+  base.sort(function (x, y) { return x.d < y.d ? -1 : x.d > y.d ? 1 : 0; });
+  var mov = base.map(function (t) { return [t.d, +t.d.slice(0, 4), +t.d.slice(5, 7), 'Sabadell', t.c, t.a, t.tipo, t.cat, '', '', t.fila]; });
+
+  var year = +hoy.slice(0, 4);
+  if (base.length && !base.some(function (t) { return +t.d.slice(0, 4) === year; })) year = +base[base.length - 1].d.slice(0, 4);
+
+  // Presupuesto: una fila por categoría; el importe del grupo va en la 4.ª columna de su primera fila.
+  var pre = [['Grupo', 'Categoría', 'Previsto', 'Presupuesto del grupo']], visto = {};
+  ['Ingreso', 'Gasto', 'Ahorro'].forEach(function (kind) {
+    cats.order.forEach(function (n) {
+      var info = cats.map[n];
+      if (info.kind !== kind) return;
+      if (!visto[info.group]) { visto[info.group] = 1; pre.push([info.group, n, 0, budget[info.group] || 0]); }
+      else pre.push(['', n, 0]);
+    });
+  });
+  var huchas = leerHuchas_(tz), aport = 0;
+  huchas.forEach(function (h) { aport += h[7] || 0; });
+  if (aport > 0) { pre.push(['Tu plan', '', '']); pre.push(['', 'Huchas (ahorro)', aport]); }
+
+  var sa = saldoActual_(base);
+  var sis = [['Año', year, ''], [], [], [], [], sa ? ['Sabadell', sa.saldo, sa.fecha] : []];
+  var cal = [], calError = '';
+  try { cal = eventos_(); } catch (e) { calError = String(e && e.message || e); }
+  return {mov: mov, pre: pre, huc: [['Hucha', 'Meta', 'Fecha', 'Llevo']].concat(huchas), sis: sis, cal: cal, calError: calError, hoy: hoy};
+}
+
+/** Cambia la categoría de un movimiento y aprende la regla. Devuelve el tipo resultante. */
+function clasificar(fila, concepto, importe, categoria) {
+  return conBloqueo_(function () {
+    var sh = ss_().getSheetByName(SH.MOV), cats = getCats_();
+    fila = Number(fila);
+    if (!(fila >= 2 && fila <= sh.getLastRow())) throw new Error('La hoja ha cambiado. Recarga la app.');
+    var r = sh.getRange(fila, 1, 1, 5).getValues()[0], a = parseAmount_(r[4]);
+    if (String(r[1]) !== String(concepto) || a === null || Math.abs(a - Number(importe)) > 0.005) throw new Error('La hoja ha cambiado. Recarga la app.');
+    var info = cats.map[categoria];
+    if (!info) throw new Error('Elige una categoría.');
+    sh.getRange(fila, 3, 1, 2).setValues([[categoria, info.group]]);
+    aprender_(concepto, categoria);
+    try { actualizarResumen(); } catch (e) {}
+    return tipo_(info, categoria, a);
+  });
+}
+
+/* ---------- Huchas (pestaña "Huchas": lo que llevas lo apuntas tú) ---------- */
+function hojaHuchas_() {
+  var sh = ss_().getSheetByName(SH.HUC);
+  if (!sh) {
+    sh = ss_().insertSheet(SH.HUC);
+    sh.getRange(1, 1, 1, 5).setValues([['Hucha', 'Meta (€)', 'Fecha objetivo', 'Llevo (€)', 'Aportación mensual (€)']])
+      .setFontWeight('bold').setBackground('#0e5a4b').setFontColor('#ffffff');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(1, 200);
+  }
+  return sh;
+}
+
+function mesesHasta_(ym, hoy) {
+  var m = /^(\d{4})-(\d{2})/.exec(String(ym || ''));
+  if (!m) return 0;
+  return (+m[1] - (+hoy.slice(0, 4))) * 12 + (+m[2] - (+hoy.slice(5, 7)));
+}
+
+/** [nombre, meta, 'aaaa-mm', llevo, '', '', necesita al mes, aportación mensual, '', fila] */
+function leerHuchas_(tz) {
+  var sh = ss_().getSheetByName(SH.HUC), out = [];
+  if (!sh || sh.getLastRow() < 2) return out;
+  var hoy = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  sh.getRange(2, 1, sh.getLastRow() - 1, 5).getValues().forEach(function (r, i) {
+    var nombre = String(r[0]).trim();
+    if (!nombre) return;
+    var meta = parseAmount_(r[1]) || 0, llevo = parseAmount_(r[3]) || 0, aport = parseAmount_(r[4]) || 0;
+    var ym = r[2] instanceof Date ? Utilities.formatDate(r[2], tz, 'yyyy-MM') : (/^\d{4}-\d{2}/.test(String(r[2])) ? String(r[2]).slice(0, 7) : '');
+    var falta = Math.max(0, meta - llevo), meses = mesesHasta_(ym, hoy);
+    var necesita = falta ? (meses > 0 ? Math.ceil(falta / meses) : falta) : 0;
+    out.push([nombre, meta, ym, llevo, '', '', necesita, aport, '', i + 2]);
+  });
+  return out;
+}
+
+function fechaHucha_(ym) {
+  var m = /^(\d{4})-(\d{2})$/.exec(String(ym || ''));
+  return m ? new Date(+m[1], +m[2] - 1, 1) : '';
+}
+
+function guardarHucha(fila, nombre, meta, ym, alMes, llevo) {
+  return conBloqueo_(function () {
+    var sh = hojaHuchas_();
+    fila = Number(fila);
+    if (!(fila >= 2) || String(sh.getRange(fila, 1).getValue()).trim() !== String(nombre)) throw new Error('La hoja ha cambiado. Recarga la app.');
+    if (!(Number(meta) > 0)) throw new Error('La meta tiene que ser mayor que cero.');
+    sh.getRange(fila, 2, 1, 4).setValues([[Number(meta), fechaHucha_(ym), Math.max(0, Number(llevo) || 0), Math.max(0, Number(alMes) || 0)]]);
+    sh.getRange(fila, 3).setNumberFormat('mm/yyyy');
+    return true;
+  });
+}
+
+function crearHucha(nombre, meta, ym, alMes) {
+  return conBloqueo_(function () {
+    nombre = String(nombre || '').trim().slice(0, 40);
+    if (!nombre || !(Number(meta) > 0)) throw new Error('Pon un nombre y cuánto quieres ahorrar.');
+    var sh = hojaHuchas_(), n = sh.getLastRow();
+    if (n >= 2 && sh.getRange(2, 1, n - 1, 1).getValues().some(function (r) { return String(r[0]).trim().toLowerCase() === nombre.toLowerCase(); }))
+      throw new Error('Ya hay una hucha con ese nombre.');
+    sh.appendRow([nombre, Number(meta), fechaHucha_(ym), 0, Math.max(0, Number(alMes) || 0)]);
+    sh.getRange(sh.getLastRow(), 3).setNumberFormat('mm/yyyy');
+    return sh.getLastRow();
+  });
+}
+
+/* ---------- Calendario de Google «Pagos» ---------- */
+function calendario_() {
+  var props = PropertiesService.getScriptProperties(), id = props.getProperty('CAL_ID'), cal = null;
+  if (id) { try { cal = CalendarApp.getCalendarById(id); } catch (e) { cal = null; } }
+  if (!cal) { var cs = CalendarApp.getOwnedCalendarsByName(CAL_NOMBRE); cal = cs.length ? cs[0] : null; }
+  if (!cal) cal = CalendarApp.createCalendar(CAL_NOMBRE);
+  props.setProperty('CAL_ID', cal.getId());
+  return cal;
+}
+
+/** Saca el importe del final de un texto: "Gimnasio 45 €", "Nómina +1.368,48", "Seguro 120,50€". */
+function importeTexto_(t) {
+  t = String(t || '').trim();
+  var m = /(^|\s)([+\-−])?\s*(\d{1,3}(?:\.\d{3})+(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*(€|eur|euros)?\s*$/i.exec(t);
+  if (!m) return {titulo: t, importe: null, signo: ''};
+  var n = parseAmount_(m[3]);
+  if (n === null || (!m[2] && !m[4] && /^(19|20)\d\d$/.test(m[3]))) return {titulo: t, importe: null, signo: ''};   // "ITV 2026" no es un importe
+  return {titulo: t.slice(0, m.index).trim() || t, importe: n, signo: m[2] === '+' ? '+' : (m[2] ? '-' : '')};
+}
+
+function eventos_() {
+  var cal = calendario_(), tz = cal.getTimeZone(), now = new Date(), out = [];
+  var desde = new Date(now.getFullYear(), now.getMonth() - 1, 1), hasta = new Date(now.getFullYear(), now.getMonth() + 4, 1);
+  cal.getEvents(desde, hasta).forEach(function (ev) {
+    var d = ev.isAllDayEvent() ? ev.getAllDayStartDate() : ev.getStartTime();
+    var p = importeTexto_(ev.getTitle());
+    if (p.importe === null) {
+      var q = importeTexto_(String(ev.getDescription() || '').split('\n')[0]);
+      if (q.importe !== null) { p.importe = q.importe; p.signo = q.signo; }
+    }
+    var rec = ev.isRecurringEvent();
+    out.push({id: rec ? '' : ev.getId(), fecha: Utilities.formatDate(d, tz, 'yyyy-MM-dd'), titulo: p.titulo.slice(0, 80), importe: p.importe,
+      cobro: p.signo === '+' || /^(cobro|n[oó]mina|ingreso)\b/i.test(p.titulo), mensual: false, serie: rec});
+  });
+  return out;
+}
+
+function addEvento(e) {
+  return conBloqueo_(function () {
+    var titulo = String(e && e.titulo || '').trim().slice(0, 60);
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(e && e.fecha || ''));
+    if (!titulo || !m) throw new Error('Falta el título o la fecha.');
+    var imp = e.importe === null || e.importe === '' || e.importe === undefined ? null : Math.abs(Number(e.importe));
+    if (imp !== null && isFinite(imp) && imp > 0) titulo += ' ' + (e.cobro ? '+' : '') + imp.toFixed(2).replace('.', ',') + ' €';
+    else if (e.cobro && !/^(cobro|n[oó]mina|ingreso)\b/i.test(titulo)) titulo = 'Cobro ' + titulo;
+    var cal = calendario_(), fecha = new Date(+m[1], +m[2] - 1, +m[3]);
+    if (e.mensual) { cal.createAllDayEventSeries(titulo, fecha, CalendarApp.newRecurrence().addMonthlyRule()); return ''; }
+    return cal.createAllDayEvent(titulo, fecha).getId();
+  });
+}
+
+function borrarEvento(id) {
+  return conBloqueo_(function () {
+    var ev = calendario_().getEventById(String(id || ''));
+    if (!ev) return false;
+    if (ev.isRecurringEvent()) throw new Error('Es un pago que se repite: bórralo en Google Calendar.');
+    ev.deleteEvent();
+    return true;
+  });
+}
